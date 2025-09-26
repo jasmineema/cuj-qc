@@ -58,6 +58,8 @@ with help_cols[1]:
 
 # Render an editor for each criterion
 to_delete = []
+to_add_after = []  # NEW: collect insertion points
+
 for idx, payload in enumerate(st.session_state.criteria, start=1):
     crit_key = f"criterion {idx}"
     crit_id = payload["_id"]  # stable id for keys
@@ -113,16 +115,16 @@ for idx, payload in enumerate(st.session_state.criteria, start=1):
                 value=bool(payload.get("human_rating", False)),
                 key=f"{crit_id}:hr",
             )
-            payload["gemini_as_autorater_rating"] = st.checkbox(
-                f"{crit_key} — gemini_as_autorater_rating",
-                value=bool(payload.get("gemini_as_autorater_rating", False)),
-                key=f"{crit_id}:gem",
-            )
-            payload["gpt_as_autorater_rating"] = st.checkbox(
-                f"{crit_key} — gpt_as_autorater_rating",
-                value=bool(payload.get("gpt_as_autorater_rating", False)),
-                key=f"{crit_id}:gpt",
-            )
+            # payload["gemini_as_autorater_rating"] = st.checkbox(
+            #     f"{crit_key} — gemini_as_autorater_rating",
+            #     value=bool(payload.get("gemini_as_autorater_rating", False)),
+            #     key=f"{crit_id}:gem",
+            # )
+            # payload["gpt_as_autorater_rating"] = st.checkbox(
+            #     f"{crit_key} — gpt_as_autorater_rating",
+            #     value=bool(payload.get("gpt_as_autorater_rating", False)),
+            #     key=f"{crit_id}:gpt",
+            # )
 
             # --- multiselects ---
             # criterion_type: allow multiple values — BIND TO STATE, NO default=
@@ -165,13 +167,25 @@ for idx, payload in enumerate(st.session_state.criteria, start=1):
             ]
 
         # remove button for this criterion
-        if st.button(f"Remove {crit_key}", key=f"{crit_id}:rm"):
-            to_delete.append((idx - 1, crit_id))
+        col_rm, col_add = st.columns([1, 1])  # NEW: side-by-side buttons
+        with col_rm:
+            if st.button(f"Remove {crit_key}", key=f"{crit_id}:rm"):
+                to_delete.append((idx - 1, crit_id))
+        with col_add:
+            # NEW: create new criterion after this one
+            if st.button("Create new criterion", key=f"{crit_id}:add"):
+                # Record 1-based position to insert after
+                to_add_after.append(idx)
 
 # apply removals (from end to start to keep indices valid) and clean widget state
 for idx, crit_id in sorted(to_delete, key=lambda x: x[0], reverse=True):
     del st.session_state.criteria[idx]
     _clear_keys_for(crit_id)
+
+# NEW: apply insertions (from end to start so indices remain valid)
+for after_idx in sorted(to_add_after, reverse=True):
+    insert_at = after_idx  # because list is 0-based and we want "after current"
+    st.session_state.criteria.insert(insert_at, _empty_payload())
 
 # Build JSON (list of { "criterion n": {payload} } )
 rubric_list = []
