@@ -2,12 +2,24 @@
 import streamlit as st
 import pandas as pd
 import csv, io, json, re
+from collections import Counter
 
 # ---------- Page setup ----------
 st.set_page_config(
     page_title="CSV Cleaner + Rubric Validator", page_icon="🧹", layout="wide"
 )
+
+# # Shows a clickable link to the page
+# st.page_link("pages/analysis.py", label="➡️ Go to Analysis")
 st.title("🧹 CSV Cleaner + Rubric Validator")
+
+if st.button("Take me to Create JSON Page"):
+    # Jumps straight to the other page
+    st.switch_page("pages/create_json.py")
+
+# if st.button("Take me to Fix JSON Page"):
+#     # Jumps straight to the other page
+#     st.switch_page("pages/fix_json.py")
 
 
 # ---------- Helpers ----------
@@ -93,6 +105,21 @@ def _criterion_key(item):
     return None, None
 
 
+def find_smart_quotes(obj, path="$"):
+    smart_quotes = {"“", "”", "‘", "’"}
+    errs = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if any(c in str(k) for c in smart_quotes):
+                errs.append(f"{path}.{k} (key) contains smart quotes.")
+            errs.extend(find_smart_quotes(v, f"{path}.{k}"))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            errs.extend(find_smart_quotes(v, f"{path}[{i}]"))
+    # 🔁 Remove string check entirely
+    return errs
+
+
 def validate_single_rubric_object(item, idx_in_list, all_names):
     """
     Validate a single rubric object against schema + cross-refs.
@@ -111,14 +138,17 @@ def validate_single_rubric_object(item, idx_in_list, all_names):
         return errs
 
     criterion_name, payload = next(iter(item.items()))
+    # Check all keys and values for smart quotes
+    errs.extend([f"[{idx_in_list}] {e}" for e in find_smart_quotes(item)])
+
     if not isinstance(criterion_name, str) or not criterion_name.strip():
         errs.append(f"[{idx_in_list}] criterion key must be a non-empty string.")
 
     # Optional pattern check
-    if not re.match(
-        r"^criterion\s+\d+\s*$", str(criterion_name).strip(), flags=re.IGNORECASE
-    ):
-        errs.append(f"[{idx_in_list}] criterion key should look like 'criterion N'.")
+    if not re.fullmatch(r"criterion \d+", criterion_name):
+        errs.append(
+            f"[{idx_in_list}] Invalid key '{criterion_name}': must match exact format \"criterion <number>\" with lowercase keyword and space separator."
+        )
 
     if not isinstance(payload, dict):
         errs.append(f"[{idx_in_list}] value for '{criterion_name}' must be an object.")
@@ -134,13 +164,21 @@ def validate_single_rubric_object(item, idx_in_list, all_names):
     # Types + constraints
     if "description" in payload and not isinstance(payload["description"], str):
         errs.append(f"[{idx_in_list}] 'description' must be string.")
-    if "sources" in payload and not isinstance(payload["sources"], str):
-        errs.append(f"[{idx_in_list}] 'sources' must be string.")
+    if "sources" in payload:
+        sources = payload["sources"]
+        if not isinstance(sources, list):
+            errs.append(f"[{idx_in_list}] 'sources' must be a list of strings.")
+        else:
+            if not all(isinstance(s, str) and s.strip() for s in sources):
+                errs.append(
+                    f"[{idx_in_list}] 'sources' must contain only non-empty strings."
+                )
+
     if "justification" in payload and not isinstance(payload["justification"], str):
         errs.append(f"[{idx_in_list}] 'justification' must be string.")
     if "weight" in payload and payload["weight"] not in ALLOWED_WEIGHTS:
         errs.append(
-            f"[{idx_in_list}] 'weight' must be one of {sorted(ALLOWED_WEIGHTS)}."
+            f"[{idx_in_list}] 'weight' must be either 'Primary Objective(s)' or 'Not Primary Objective'. Found: {payload['weight']!r}"
         )
     for b in ["human_rating", "gemini_as_autorater_rating", "gpt_as_autorater_rating"]:
         if b in payload and not isinstance(payload[b], bool):
@@ -214,6 +252,39 @@ def normalized_json(value):
     """Pretty-print JSON string with stable formatting (2-space indent)."""
     obj = value if isinstance(value, (list, dict)) else json.loads(value)
     return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
+criterion_pattern = re.compile(r"^criterion\s*(\d+)$", re.I)
+
+
+def check(x, n):
+    n = int(n)
+    if not x or (isinstance(x, str) and not x.strip()):
+        return {"missing": list(range(1, n + 1)), "duplicated": [], "misordered": []}
+    try:
+        arr = x if isinstance(x, list) else json.loads(x)
+    except Exception:
+        return "invalid_json"
+
+    nums = []
+    for d in arr:
+        if isinstance(d, dict):
+            for k in d.keys():  # only top-level keys
+                m = criterion_pattern.match(k)
+                if m:
+                    nums.append(int(m.group(1)))
+                    break
+
+    w = [i for i in nums if 1 <= i <= n]  # only count 1..n
+    if w == list(range(1, n + 1)) and len(w) == len(nums):
+        return True
+
+    c = Counter(w)
+    return {
+        "missing": [i for i in range(1, n + 1) if c[i] == 0],
+        "duplicated": sorted(i for i, v in c.items() if v > 1),
+        "misordered": [(pos, val) for pos, val in enumerate(w, 1) if val != pos],
+    }
 
 
 def init_state():
@@ -370,6 +441,18 @@ st.subheader("3) Rubric JSON validation (column-wide)")
 # Build options & pick a sensible default (first col containing 'rubric')
 options = list(df.columns)
 likely_cols = [c for c in options if isinstance(c, str) and "rubric" in c.lower()]
+id_col = [c for c in options if isinstance(c, str) and "id" in c.lower()]
+try:
+    default_id = int(options.index(id_col[0])) if id_col else 0
+except ValueError:
+    default_id = 0
+prompt_id_col = st.selectbox(
+    "Select the column that contains the Prompt ID",
+    options=options,
+    index=default_id if len(options) else 0,
+    help="This value will be used to label each row in the validation output.",
+)
+
 try:
     default_idx = int(options.index(likely_cols[0])) if likely_cols else 0
 except ValueError:
@@ -566,16 +649,84 @@ def _error_fix_note(before: str, after: str) -> str:
     return f'Error: "{b}" \u2192 Fix: "{a}"'
 
 
+import json, re
+import pandas as pd
+
+# put near your other helpers
+_crit_pat = re.compile(r"^criterion\s*\d+$", re.I)
+
+
+def count_criteria(cell):
+    """Return the number of top-level criterion objects in a rubric JSON cell."""
+    if pd.isna(cell) or (isinstance(cell, str) and not cell.strip()):
+        return 0
+    try:
+        obj = cell if isinstance(cell, (list, dict)) else json.loads(cell)
+    except Exception:
+        return pd.NA  # invalid JSON → missing
+
+    # coerce dict → list of single-key dicts
+    if isinstance(obj, dict):
+        obj = [{k: v} for k, v in obj.items()]
+    if not isinstance(obj, list):
+        return pd.NA
+
+    cnt = 0
+    for item in obj:
+        if isinstance(item, dict) and len(item) == 1:
+            k = next(iter(item.keys()))
+            if isinstance(k, str) and _crit_pat.fullmatch(k):
+                cnt += 1
+    return cnt
+
+
+# compute/update the column (use your selected rubric_col)
+df["n_criteria"] = df[rubric_col].apply(count_criteria).astype("Int64")
+
+
+def _safe_int(n):
+    try:
+        return 0 if pd.isna(n) else int(n)
+    except Exception:
+        return 0
+
+
+df["order_check"] = df.apply(
+    lambda r: check(r[rubric_col], _safe_int(r["n_criteria"])), axis=1
+)
+asdict = lambda v: (
+    {"missing": [], "duplicated": [], "misordered": []}
+    if v is True
+    else (v if isinstance(v, dict) else None)
+)
+fmt = lambda xs: [f"criterion {i}" for i in xs] if isinstance(xs, list) else pd.NA
+
+df["missing_list"] = df["order_check"].map(
+    lambda v: fmt(asdict(v)["missing"]) if asdict(v) is not None else pd.NA
+)
+df["duplicated_list"] = df["order_check"].map(
+    lambda v: fmt(asdict(v)["duplicated"]) if asdict(v) is not None else pd.NA
+)
+df["misordered_list"] = df["order_check"].map(
+    lambda v: asdict(v)["misordered"] if asdict(v) is not None else pd.NA
+)
+
 if st.button("Validate all rows"):
     results = []
     normalized_values = {}
     fixes_applied = 0
 
     for idx, cell in df[rubric_col].items():
+        prompt_id = df.at[idx, prompt_id_col] if prompt_id_col in df.columns else idx
+        n_crit = df.at[idx, "n_criteria"]
+        order_info = df.at[idx, "order_check"]
+
         if pd.isna(cell) or (isinstance(cell, str) and cell.strip() == ""):
             results.append(
                 {
-                    "row_index": idx,
+                    "Prompt ID": prompt_id,
+                    "n_criteria": n_crit,
+                    "order_check": order_info,
                     "valid": False,
                     "fixed": False,
                     "error_count": 1,
@@ -591,7 +742,9 @@ if st.button("Validate all rows"):
                 normalized_values[idx] = normalized_json(cell)
             results.append(
                 {
-                    "row_index": idx,
+                    "Prompt ID": prompt_id,
+                    "n_criteria": n_crit,
+                    "order_check": order_info,
                     "valid": True,
                     "fixed": False,
                     "error_count": 0,
@@ -608,16 +761,15 @@ if st.button("Validate all rows"):
                 if ok_norm:
                     fixes_applied += 1
                     explicit_note = _error_fix_note(cell, norm_text)
-
                     if normalize_checkbox:
                         normalized_values[idx] = norm_text
-
                     combined_notes = [*notes] if notes else []
                     combined_notes.append(explicit_note)
-
                     results.append(
                         {
-                            "row_index": idx,
+                            "Prompt ID": prompt_id,
+                            "n_criteria": n_crit,
+                            "order_check": order_info,
                             "valid": True,
                             "fixed": True,
                             "error_count": 0,
@@ -625,16 +777,15 @@ if st.button("Validate all rows"):
                             "notes": "; ".join(combined_notes),
                         }
                     )
-
                 else:
-                    # Make the note useful even if earlier steps produced no granular notes
                     fail_hint = _shorten_for_note("Normalization/validation failed")
                     combined_notes = [*notes] if notes else []
                     combined_notes.append(fail_hint)
-
                     results.append(
                         {
-                            "row_index": idx,
+                            "Prompt ID": prompt_id,
+                            "n_criteria": n_crit,
+                            "order_check": order_info,
                             "valid": False,
                             "fixed": True,
                             "error_count": len(errs_after),
@@ -642,11 +793,12 @@ if st.button("Validate all rows"):
                             "notes": "; ".join(combined_notes),
                         }
                     )
-
             else:
                 results.append(
                     {
-                        "row_index": idx,
+                        "Prompt ID": prompt_id,
+                        "n_criteria": n_crit,
+                        "order_check": order_info,
                         "valid": False,
                         "fixed": False,
                         "error_count": 1,
@@ -657,7 +809,9 @@ if st.button("Validate all rows"):
         else:
             results.append(
                 {
-                    "row_index": idx,
+                    "Prompt ID": prompt_id,
+                    "n_criteria": n_crit,
+                    "order_check": order_info,
                     "valid": False,
                     "fixed": False,
                     "error_count": len(errs_direct),
@@ -667,7 +821,7 @@ if st.button("Validate all rows"):
             )
 
     results_df = pd.DataFrame(results).sort_values(
-        ["valid", "fixed", "error_count", "row_index"],
+        ["valid", "fixed", "error_count", "Prompt ID"],
         ascending=[True, False, True, True],
     )
 
@@ -681,25 +835,85 @@ if st.button("Validate all rows"):
     if auto_fix:
         st.caption(f"Auto-fixes applied to {fixes_applied} row(s).")
 
-    # Show table of results
-    st.dataframe(results_df, use_container_width=True, hide_index=True)
+    # --- Build combined "Criterion Order Check + Errors" table in one expander ---
+
+
+def _collect_errors(cell):
+    # Empty cell
+    if pd.isna(cell) or (isinstance(cell, str) and not cell.strip()):
+        return False, ["Cell is empty / missing rubric JSON."]
+    # Validate against your schema
+    try:
+        ok, errs = validate_rubric_json(
+            cell if isinstance(cell, (list, dict)) else cell
+        )
+        return ok, errs if not ok else []
+    except Exception as e:
+        return False, [f"Validation crashed: {e}"]
+
+
+# run validation (no auto-fix) to get error lists/counts per row
+_ok_errs = df[rubric_col].apply(_collect_errors)
+error_count = _ok_errs.apply(lambda t: 0 if t[0] else len(t[1]))
+errors_joined = _ok_errs.apply(lambda t: "" if t[0] else " | ".join(t[1]))
+
+# build the combined view
+combined_view = pd.DataFrame(
+    {
+        "Prompt ID": df[prompt_id_col],
+        "rubric": df[rubric_col].astype(str),
+        "n_criteria": df["n_criteria"],
+        "error_count": error_count,
+        "errors": errors_joined,
+        "missing": df["missing_list"],
+        "duplicated": df["duplicated_list"],
+        "misordered": df["misordered_list"],
+    }
+)
+
+cols = [
+    "Prompt ID",
+    "rubric",
+    "n_criteria",
+    "error_count",
+    "errors",
+    "missing",
+    "duplicated",
+    "misordered",
+]
+st.dataframe(combined_view[cols], use_container_width=True, hide_index=True)
+
+
+# optional: sort to show problem rows first
+combined_view = combined_view.sort_values(
+    ["error_count", "Prompt ID"], ascending=[False, True]
+)
+
+st.subheader("🔍 Criterion Order Check & Errors")
+with st.expander("Show order check & validation errors", expanded=False):
+    st.dataframe(
+        combined_view[["Prompt ID", "rubric", "n_criteria", "error_count", "errors"]],
+        use_container_width=True,
+        hide_index=True,
+    )
 
     # Write back normalized JSON (from already-valid or fixed rows)
     if normalize_checkbox and normalized_values:
-        df.loc[list(normalized_values.keys()), rubric_col] = pd.Series(
-            normalized_values
-        )
-        st.session_state["df"] = df
-        st.success(
-            f"Wrote normalized JSON back to '{rubric_col}' for {len(normalized_values)} row(s)."
-        )
+        if "results_df" in locals() and "normalized_values" in locals():
+            df.loc[list(normalized_values.keys()), rubric_col] = pd.Series(
+                normalized_values
+            )
+            st.session_state["df"] = df
+            st.success(
+                f"Wrote normalized JSON back to '{rubric_col}' for {len(normalized_values)} row(s)."
+            )
 
-    # Downloadable error report (CSV)
-    csv_buf = io.StringIO()
-    results_df.to_csv(csv_buf, index=False)
-    st.download_button(
-        "Download validation report (CSV)",
-        data=csv_buf.getvalue(),
-        file_name="rubric_validation_report.csv",
-        mime="text/csv",
-    )
+        # Downloadable error report (CSV)
+        csv_buf = io.StringIO()
+        results_df.to_csv(csv_buf, index=False)
+        st.download_button(
+            "Download validation report (CSV)",
+            data=csv_buf.getvalue(),
+            file_name="rubric_validation_report.csv",
+            mime="text/csv",
+        )
